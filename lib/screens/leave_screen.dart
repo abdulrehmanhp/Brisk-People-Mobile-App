@@ -82,10 +82,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
     ];
     if (_canManageTeam) {
       futures.add(
-        LeaveService.getTeamLeaveRequests(
-          _token!,
-          currentEmployeeId: _userId,
-        ),
+        LeaveService.getTeamLeaveRequests(_token!, currentEmployeeId: _userId),
       );
     }
 
@@ -469,8 +466,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
                                     leaveTypeId: selectedType.leaveTypeId,
                                     startDate: fromDate,
                                     endDate: toDate,
-                                    reason:
-                                        reasonController?.text.trim() ?? '',
+                                    reason: reasonController?.text.trim() ?? '',
                                   );
 
                                   final submitResult =
@@ -581,7 +577,6 @@ class _LeaveScreenState extends State<LeaveScreen> {
   void _showMessage(String msg, {bool isError = false}) {
     if (!mounted) return;
     final overlay = Overlay.of(context);
-    if (overlay == null) return;
     late OverlayEntry entry;
     entry = OverlayEntry(
       builder: (ctx) {
@@ -1416,7 +1411,9 @@ class _LeaveScreenState extends State<LeaveScreen> {
       context: context,
       builder: (ctx) {
         return AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+          ),
           title: const Text('Cancel Leave Request?'),
           content: Text(
             'This will withdraw your request for ${_titleCase(item.typeName)} (${_rangeText(item)}). You can submit a new request later.',
@@ -1585,7 +1582,10 @@ class _LeaveScreenState extends State<LeaveScreen> {
                 ),
               ),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 4,
+                ),
                 decoration: BoxDecoration(
                   color: const Color(0xFFFEF3C7),
                   borderRadius: BorderRadius.circular(999),

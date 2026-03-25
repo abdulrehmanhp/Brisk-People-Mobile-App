@@ -1,6 +1,13 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
+import 'package:image_picker/image_picker.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/auth_service.dart';
+import '../services/permission_service.dart';
 import 'login_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
@@ -16,6 +23,11 @@ class _ProfileScreenState extends State<ProfileScreen> {
   String _email = '';
   String _role = '';
   String _organization = '';
+  String _profileImageUrl = '';
+  bool _isPhotoBusy = false;
+  // Whether the user has permission to edit announcements — resolved via the
+  // permissions API instead of hard-coding role strings.
+  bool _canEditAnnouncement = false;
   final TextEditingController _announcementTitleController =
       TextEditingController();
   final TextEditingController _announcementBodyController =
@@ -44,7 +56,28 @@ class _ProfileScreenState extends State<ProfileScreen> {
         _email = info['email'] ?? '';
         _role = info['role'] ?? '';
         _organization = info['organization'] ?? '';
+        _profileImageUrl = info['profileUrl'] ?? '';
       });
+    }
+
+    final refreshed = await AuthService.getProfilePictureDisplayUrl(
+      refresh: true,
+    );
+    if (mounted && refreshed != null) {
+      setState(() => _profileImageUrl = refreshed);
+    }
+
+    // Resolve announcement-edit permission from the permissions API.
+    // The action key 'admin_dashboard' under Admin Dashboard → Admin Dashboard
+    // is used by the web frontend to gate admin-only features such as editing
+    // announcements. We mirror that check here instead of hard-coding roles.
+    final canEdit = await PermissionService.hasActionPermission(
+      'Admin Dashboard',
+      'Admin Dashboard',
+      'admin_dashboard',
+    );
+    if (mounted) {
+      setState(() => _canEditAnnouncement = canEdit);
     }
   }
 
@@ -55,13 +88,6 @@ class _ProfileScreenState extends State<ProfileScreen> {
     _announcementBodyController.text =
         prefs.getString('announcement_body') ??
         'Public Holiday observation. Enjoy your day off!';
-  }
-
-  bool get _isSuperAdmin {
-    final role = _role.toLowerCase();
-    return role == 'super admin' ||
-        role.contains('superadmin') ||
-        role.contains('super admin');
   }
 
   Future<void> _saveAnnouncement() async {
@@ -138,6 +164,170 @@ class _ProfileScreenState extends State<ProfileScreen> {
     });
   }
 
+  Future<void> _uploadOrChangeProfilePicture() async {
+    if (_isPhotoBusy) return;
+    final wasEmpty = _profileImageUrl.trim().isEmpty;
+    setState(() => _isPhotoBusy = true);
+
+    XFile? picked;
+    try {
+      picked = await ImagePicker().pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 85,
+        maxWidth: 1800,
+        maxHeight: 1800,
+      );
+    } on MissingPluginException {
+      if (!mounted) return;
+      _showTopMessage(
+        'Image picker is not ready yet. Please fully restart the app and try again.',
+        success: false,
+      );
+      return;
+    } on PlatformException catch (_) {
+      if (!mounted) return;
+
+      final granted = await _requestGalleryPermission();
+      if (!granted) {
+        await _showGalleryPermissionDialog();
+        return;
+      }
+
+      try {
+        picked = await ImagePicker().pickImage(
+          source: ImageSource.gallery,
+          imageQuality: 85,
+          maxWidth: 1800,
+          maxHeight: 1800,
+        );
+      } on PlatformException catch (_) {
+        if (!mounted) return;
+        await _showGalleryPermissionDialog();
+        return;
+      }
+    } catch (e) {
+      if (!mounted) return;
+      _showTopMessage(
+        'Unable to open gallery right now. Please try again.',
+        success: false,
+      );
+      return;
+    }
+
+    try {
+      if (picked == null) return;
+
+      final selectedFile = File(picked.path);
+      final uploadFile = await _prepareImageForUpload(selectedFile);
+      final uploadedUrl = await AuthService.uploadProfilePic(uploadFile);
+      await AuthService.updateProfilePictureUrl(uploadedUrl);
+      final displayUrl = await AuthService.getProfilePictureDisplayUrl();
+
+      if (!mounted) return;
+      setState(() => _profileImageUrl = displayUrl ?? uploadedUrl);
+      _showTopMessage(
+        wasEmpty
+            ? 'Profile picture uploaded successfully.'
+            : 'Profile picture updated successfully.',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      _showTopMessage(
+        e.toString().replaceFirst('Exception: ', '').trim(),
+        success: false,
+      );
+    } finally {
+      if (mounted) setState(() => _isPhotoBusy = false);
+    }
+  }
+
+  Future<File> _prepareImageForUpload(File selectedFile) async {
+    final rawBytes = await selectedFile.readAsBytes();
+    final decoded = img.decodeImage(rawBytes);
+
+    if (decoded == null) {
+      throw Exception(
+        'Selected file is not a valid image. Please choose JPG or PNG.',
+      );
+    }
+
+    final jpgBytes = img.encodeJpg(decoded, quality: 90);
+    final tempFile = File(
+      '${Directory.systemTemp.path}/profile_${DateTime.now().millisecondsSinceEpoch}.jpg',
+    );
+    await tempFile.writeAsBytes(jpgBytes, flush: true);
+    return tempFile;
+  }
+
+  Future<bool> _requestGalleryPermission() async {
+    if (Platform.isIOS) {
+      final photos = await Permission.photos.request();
+      return photos.isGranted || photos.isLimited;
+    }
+
+    if (Platform.isAndroid) {
+      final photos = await Permission.photos.request();
+      if (photos.isGranted || photos.isLimited) return true;
+
+      final storage = await Permission.storage.request();
+      return storage.isGranted;
+    }
+
+    return true;
+  }
+
+  Future<void> _showGalleryPermissionDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('Allow Photo Access'),
+          content: const Text(
+            'To upload a profile picture, allow gallery/photo library access. Tap Allow Access to open settings.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('Not Now'),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                Navigator.of(ctx).pop();
+                await openAppSettings();
+              },
+              child: const Text('Allow Access'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _deleteProfilePicture() async {
+    if (_isPhotoBusy) return;
+    if (_profileImageUrl.trim().isEmpty) {
+      _showTopMessage('No profile picture found to delete.', success: false);
+      return;
+    }
+
+    setState(() => _isPhotoBusy = true);
+    try {
+      try {
+        await AuthService.deleteUploadedFile(_profileImageUrl);
+      } catch (_) {}
+
+      try {
+        await AuthService.updateProfilePictureUrl('');
+      } catch (_) {}
+
+      if (!mounted) return;
+      setState(() => _profileImageUrl = '');
+      _showTopMessage('Profile picture removed successfully.');
+    } finally {
+      if (mounted) setState(() => _isPhotoBusy = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final name = '$_firstName $_lastName'.trim();
@@ -171,33 +361,90 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
                   child: Column(
                     children: [
-                      const Text('Profile',
-                          style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 20,
-                              fontWeight: FontWeight.bold)),
-                      const SizedBox(height: 24),
-                      CircleAvatar(
-                        radius: 40,
-                        backgroundColor: Colors.white24,
-                        child: Text(
-                          _getInitials(name),
-                          style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 28,
-                              fontWeight: FontWeight.bold),
+                      const Text(
+                        'Profile',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
                         ),
                       ),
+                      const SizedBox(height: 24),
+                      CircleAvatar(
+                        radius: 44,
+                        backgroundColor: Colors.white24,
+                        backgroundImage: _profileImageUrl.trim().isNotEmpty
+                            ? NetworkImage(_profileImageUrl)
+                            : null,
+                        child: _profileImageUrl.trim().isEmpty
+                            ? Text(
+                                _getInitials(name),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              )
+                            : null,
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: _isPhotoBusy
+                                ? null
+                                : _uploadOrChangeProfilePicture,
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white,
+                              side: const BorderSide(color: Colors.white70),
+                            ),
+                            icon: _isPhotoBusy
+                                ? const SizedBox(
+                                    width: 14,
+                                    height: 14,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : Icon(
+                                    _profileImageUrl.trim().isEmpty
+                                        ? Icons.upload_rounded
+                                        : Icons.photo_camera_outlined,
+                                  ),
+                            label: const Text('Upload Picture'),
+                          ),
+                          OutlinedButton.icon(
+                            onPressed: _isPhotoBusy
+                                ? null
+                                : _deleteProfilePicture,
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.white,
+                              side: const BorderSide(color: Colors.white70),
+                            ),
+                            icon: const Icon(Icons.delete_outline),
+                            label: const Text('Delete Picture'),
+                          ),
+                        ],
+                      ),
                       const SizedBox(height: 12),
-                      Text(name.isEmpty ? 'Employee' : name,
-                          style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 22,
-                              fontWeight: FontWeight.bold)),
+                      Text(
+                        name.isEmpty ? 'Employee' : name,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
                       const SizedBox(height: 4),
-                      Text(_role.isEmpty ? 'Role' : _role,
-                          style: const TextStyle(
-                              color: Colors.white70, fontSize: 14)),
+                      Text(
+                        _role.isEmpty ? 'Role' : _role,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 14,
+                        ),
+                      ),
                     ],
                   ),
                 ),
@@ -214,7 +461,7 @@ class _ProfileScreenState extends State<ProfileScreen> {
                   _buildInfoTile(Icons.email, 'Email', _email),
                   _buildInfoTile(Icons.business, 'Organization', _organization),
                   _buildInfoTile(Icons.badge, 'Role', _role),
-                  if (_isSuperAdmin) ...[
+                  if (_canEditAnnouncement) ...[
                     const SizedBox(height: 8),
                     _buildAnnouncementEditor(),
                   ],
@@ -229,21 +476,26 @@ class _ProfileScreenState extends State<ProfileScreen> {
                           Navigator.pushAndRemoveUntil(
                             context,
                             MaterialPageRoute(
-                                builder: (_) => const LoginScreen()),
+                              builder: (_) => const LoginScreen(),
+                            ),
                             (route) => false,
                           );
                         }
                       },
                       icon: const Icon(Icons.logout, color: Colors.white),
-                      label: const Text('Logout',
-                          style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 16,
-                              fontWeight: FontWeight.w600)),
+                      label: const Text(
+                        'Logout',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFFE74C3C),
                         shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12)),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
                       ),
                     ),
                   ),
@@ -279,15 +531,22 @@ class _ProfileScreenState extends State<ProfileScreen> {
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(label,
-                  style: TextStyle(
-                      color: Colors.grey.shade500,
-                      fontSize: 12,
-                      fontWeight: FontWeight.w500)),
+              Text(
+                label,
+                style: TextStyle(
+                  color: Colors.grey.shade500,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                ),
+              ),
               const SizedBox(height: 2),
-              Text(value.isEmpty ? '—' : value,
-                  style: const TextStyle(
-                      fontSize: 15, fontWeight: FontWeight.w600)),
+              Text(
+                value.isEmpty ? '—' : value,
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
             ],
           ),
         ],

@@ -5,13 +5,10 @@ class LoginRequest {
   const LoginRequest({required this.email, required this.password});
 
   factory LoginRequest.fromJson(Map<String, dynamic> json) =>
-      LoginRequest(
-        email: json['email'], 
-        password: json['password']);
+      LoginRequest(email: json['email'], password: json['password']);
 
   Map<String, dynamic> toJson() => {'email': email, 'password': password};
 }
-
 
 class AuthResponse {
   final String? userId;
@@ -20,6 +17,7 @@ class AuthResponse {
   final String lastName;
   final String roleName;
   final String organizationName;
+  final String? profileImage;
   final String token;
   final String refreshToken;
   final DateTime tokenExpiration;
@@ -31,6 +29,7 @@ class AuthResponse {
     required this.lastName,
     required this.roleName,
     required this.organizationName,
+    this.profileImage,
     required this.token,
     required this.refreshToken,
     required this.tokenExpiration,
@@ -43,6 +42,11 @@ class AuthResponse {
     lastName: json['lastName'],
     roleName: json['roleName'],
     organizationName: json['organizationName'],
+    profileImage:
+        (json['profileImage'] ??
+                json['profilePictureUrl'] ??
+                json['profileurl'])
+            ?.toString(),
     token: json['token'],
     refreshToken: json['refreshToken'],
     tokenExpiration:

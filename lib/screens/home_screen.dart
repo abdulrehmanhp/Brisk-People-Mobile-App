@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../services/attendance_service.dart';
 import '../services/auth_service.dart';
 import '../services/leave_service.dart';
+import '../services/permission_service.dart';
 import 'profile_screen.dart';
 import 'attendance_screen.dart';
 import 'attendance_history_screen.dart';
@@ -22,7 +23,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => HomeScreenState();
 }
 
-class HomeScreenState extends State<HomeScreen> {
+class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   late Timer _timer;
   Timer? _approvalRefreshTimer;
   DateTime _currentTime = DateTime.now();
@@ -32,6 +33,7 @@ class HomeScreenState extends State<HomeScreen> {
   String _lastName = '';
   String _role = '';
   String _userId = '';
+  String _profileImageUrl = '';
 
   // Attendance
   DateTime? checkInTime;
@@ -56,12 +58,16 @@ class HomeScreenState extends State<HomeScreen> {
 
   List<LeaveRequestItem> _pendingLeaveApprovals = [];
   List<ShiftSwapRequestItem> _pendingShiftSwapApprovals = [];
+  // Whether the user can approve team leave/shift-swap requests.
+  // Resolved from the permissions API — no role strings here.
+  bool _canApproveRequests = false;
   String _announcementTitle = 'Office closed on 23 March';
   String _announcementBody = 'Public Holiday observation. Enjoy your day off!';
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) {
         setState(() => _currentTime = DateTime.now());
@@ -86,9 +92,18 @@ class HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _timer.cancel();
     _approvalRefreshTimer?.cancel();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // Refresh profile picture when app comes to foreground
+      _refreshProfilePicture();
+    }
   }
 
   void _recalcLiveHours() {
@@ -107,9 +122,40 @@ class HomeScreenState extends State<HomeScreen> {
         _lastName = info['lastName'] ?? '';
         _role = info['role'] ?? '';
         _userId = info['userId'] ?? '';
+        _profileImageUrl = info['profileUrl'] ?? '';
       });
     }
+
+    final refreshed = await AuthService.getProfilePictureDisplayUrl(
+      refresh: true,
+    );
+    if (mounted && refreshed != null) {
+      setState(() => _profileImageUrl = refreshed);
+    }
+
+    // Resolve approval capability from the permissions API.
+    // We check 'team_leave_approve' under Leave Management -> Team Leaves,
+    // which is exactly what the web frontend uses to gate manager-level access.
+    final canApprove = await PermissionService.hasActionPermission(
+      'Leave Management',
+      'Team Leaves',
+      'team_leave_approve',
+    );
+    if (mounted) {
+      setState(() => _canApproveRequests = canApprove);
+    }
+
     await _loadPendingApprovals();
+  }
+
+  Future<void> _refreshProfilePicture() async {
+    // Refresh profile picture URL when returning from profile screen
+    final refreshed = await AuthService.getProfilePictureDisplayUrl(
+      refresh: true,
+    );
+    if (mounted && refreshed != null && refreshed != _profileImageUrl) {
+      setState(() => _profileImageUrl = refreshed);
+    }
   }
 
   Future<void> loadTodayAttendance() async {
@@ -273,11 +319,6 @@ class HomeScreenState extends State<HomeScreen> {
     if (mounted) setState(() => _weeklyAttendance = weekly);
   }
 
-  bool get _canApproveRequests {
-    final r = _role.toLowerCase();
-    return r.contains('manager') || r.contains('admin') || r.contains('hr');
-  }
-
   Future<void> _loadAnnouncementFromStorage() async {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
@@ -299,27 +340,31 @@ class HomeScreenState extends State<HomeScreen> {
       _role = info['role'] ?? '';
     }
 
+    // Re-check permission flag in case it wasn't loaded yet (e.g. on timer
+    // refresh before _loadUserInfo completes on first launch).
+    if (!_canApproveRequests) {
+      final canApprove = await PermissionService.hasActionPermission(
+        'Leave Management',
+        'Team Leaves',
+        'team_leave_approve',
+      );
+      if (mounted && canApprove != _canApproveRequests) {
+        setState(() => _canApproveRequests = canApprove);
+      }
+    }
+
     final futures = <Future<dynamic>>[];
     if (_canApproveRequests) {
       futures.add(
-        LeaveService.getTeamLeaveRequests(
-          _token!,
-          currentEmployeeId: _userId,
-        ),
+        LeaveService.getTeamLeaveRequests(_token!, currentEmployeeId: _userId),
       );
       futures.add(AttendanceService.getPendingShiftSwapRequests(_token!));
     } else {
       futures.add(
-        LeaveService.getMyLeaveRequests(
-          _token!,
-          currentEmployeeId: _userId,
-        ),
+        LeaveService.getMyLeaveRequests(_token!, currentEmployeeId: _userId),
       );
       futures.add(
-        AttendanceService.getShiftSwapRequestsByEmployee(
-          _token!,
-          _userId,
-        ),
+        AttendanceService.getShiftSwapRequestsByEmployee(_token!, _userId),
       );
     }
 
@@ -366,12 +411,20 @@ class HomeScreenState extends State<HomeScreen> {
   ) async {
     final prefs = await SharedPreferences.getInstance();
     final previousLeaveIds =
-        prefs.getStringList(_notifKey('manager_pending_leave_ids')) ?? <String>[];
+        prefs.getStringList(_notifKey('manager_pending_leave_ids')) ??
+        <String>[];
     final previousSwapIds =
-        prefs.getStringList(_notifKey('manager_pending_swap_ids')) ?? <String>[];
+        prefs.getStringList(_notifKey('manager_pending_swap_ids')) ??
+        <String>[];
 
-    final leaveIds = pendingLeaves.map((e) => e.requestId).where((e) => e.isNotEmpty).toSet();
-    final swapIds = pendingSwaps.map((e) => e.requestId).where((e) => e.isNotEmpty).toSet();
+    final leaveIds = pendingLeaves
+        .map((e) => e.requestId)
+        .where((e) => e.isNotEmpty)
+        .toSet();
+    final swapIds = pendingSwaps
+        .map((e) => e.requestId)
+        .where((e) => e.isNotEmpty)
+        .toSet();
 
     for (final leave in pendingLeaves) {
       if (!previousLeaveIds.contains(leave.requestId)) {
@@ -407,8 +460,14 @@ class HomeScreenState extends State<HomeScreen> {
       }
     }
 
-    await prefs.setStringList(_notifKey('manager_pending_leave_ids'), leaveIds.toList());
-    await prefs.setStringList(_notifKey('manager_pending_swap_ids'), swapIds.toList());
+    await prefs.setStringList(
+      _notifKey('manager_pending_leave_ids'),
+      leaveIds.toList(),
+    );
+    await prefs.setStringList(
+      _notifKey('manager_pending_swap_ids'),
+      swapIds.toList(),
+    );
   }
 
   Future<void> _notifyEmployeeForDecisionUpdates(
@@ -416,8 +475,12 @@ class HomeScreenState extends State<HomeScreen> {
     List<ShiftSwapRequestItem> allSwaps,
   ) async {
     final prefs = await SharedPreferences.getInstance();
-    final previousLeaveRaw = prefs.getString(_notifKey('employee_leave_status_map'));
-    final previousSwapRaw = prefs.getString(_notifKey('employee_swap_status_map'));
+    final previousLeaveRaw = prefs.getString(
+      _notifKey('employee_leave_status_map'),
+    );
+    final previousSwapRaw = prefs.getString(
+      _notifKey('employee_swap_status_map'),
+    );
 
     Map<String, dynamic> safeDecodeMap(String? raw) {
       if (raw == null || raw.trim().isEmpty) return <String, dynamic>{};
@@ -428,7 +491,9 @@ class HomeScreenState extends State<HomeScreen> {
       return <String, dynamic>{};
     }
 
-    final Map<String, dynamic> previousLeaveMap = safeDecodeMap(previousLeaveRaw);
+    final Map<String, dynamic> previousLeaveMap = safeDecodeMap(
+      previousLeaveRaw,
+    );
     final Map<String, dynamic> previousSwapMap = safeDecodeMap(previousSwapRaw);
 
     final Map<String, String> currentLeaveMap = {};
@@ -652,10 +717,8 @@ class HomeScreenState extends State<HomeScreen> {
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (_) => const LeaveScreen(
-              showBackButton: true,
-              initialSegmentIndex: 1,
-            ),
+            builder: (_) =>
+                const LeaveScreen(showBackButton: true, initialSegmentIndex: 1),
           ),
         ).then((_) => _loadPendingApprovals());
         break;
@@ -663,10 +726,8 @@ class HomeScreenState extends State<HomeScreen> {
         Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (_) => const LeaveScreen(
-              showBackButton: true,
-              initialSegmentIndex: 0,
-            ),
+            builder: (_) =>
+                const LeaveScreen(showBackButton: true, initialSegmentIndex: 0),
           ),
         ).then((_) => _loadPendingApprovals());
         break;
@@ -1017,19 +1078,27 @@ class HomeScreenState extends State<HomeScreen> {
                             MaterialPageRoute(
                               builder: (_) => const ProfileScreen(),
                             ),
-                          ).then((_) => _loadAnnouncementFromStorage());
+                          ).then((_) async {
+                            await _loadAnnouncementFromStorage();
+                            await _loadUserInfo();
+                          });
                         },
                         child: CircleAvatar(
                           radius: 16,
                           backgroundColor: Colors.white24,
-                          child: Text(
-                            _getInitials(name),
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                              fontSize: 12,
-                            ),
-                          ),
+                          backgroundImage: _profileImageUrl.trim().isNotEmpty
+                              ? NetworkImage(_profileImageUrl)
+                              : null,
+                          child: _profileImageUrl.trim().isEmpty
+                              ? Text(
+                                  _getInitials(name),
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 12,
+                                  ),
+                                )
+                              : null,
                         ),
                       ),
                     ],
@@ -1605,7 +1674,6 @@ class HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
-
 
   // ── ANNOUNCEMENTS ──
   Widget _buildAnnouncements() {
