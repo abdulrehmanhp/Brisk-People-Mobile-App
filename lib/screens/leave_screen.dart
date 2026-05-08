@@ -71,7 +71,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
     if (_token == null || _token!.isEmpty) {
       if (mounted) {
         setState(() => _isLoading = false);
-        _showMessage('Session expired. Please login again.', isError: true);
+        _showMessage('Session expired. Please loqgin again.', isError: true);
       }
       return;
     }

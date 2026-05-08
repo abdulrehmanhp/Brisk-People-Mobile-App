@@ -137,30 +137,18 @@ class AttendanceService {
     return _smartClock(token: token, shiftId: shiftId, action: 'out');
   }
 
-  // ── Core routing: check geofence first, then branch ─────────────────────
-
-  /// Decides whether this shift uses geofencing.
-  ///
-  ///  • No geofence attached  → use the legacy clock-in/out endpoint.
-  ///    The backend already returns "late by Xh Ym" / "left early by..." in the
-  ///    message, so we just surface that message to the user.
-  ///
-  ///  • Geofence attached → request location permission, get the device
-  ///    position, then call the GeoFence/clock endpoint which validates that
-  ///    the user is inside the fence radius BEFORE recording attendance.
+  // Routes to legacy or geofence clock based on shift configuration
   static Future<AttendanceActionResult> _smartClock({
     required String token,
     required String shiftId,
     required String action,
   }) async {
-    // 1. Resolve geofence requirements for this shift.
+    // Resolve geofence requirements
     final geoFenceLookup = await _getGeoFenceRequirementForShift(
       token,
       shiftId,
     );
 
-    // If geofence requirement cannot be determined, block the action to avoid
-    // bypassing location validation for geo-fenced shifts.
     if (!geoFenceLookup.resolved) {
       return AttendanceActionResult(
         success: false,
@@ -169,12 +157,10 @@ class AttendanceService {
     }
 
     if (!geoFenceLookup.requiresGeoFence) {
-      // ── PATH A: No geofence — normal clock (with late/early message from backend)
       return _legacyClock(token, shiftId, action);
     }
 
-    // ── PATH B: Geofence exists — location is mandatory
-    // 2. Ensure location services + permission.
+    // Ensure location services + permission
     final locationCheck = await _ensureLocationPermission();
     if (!locationCheck.granted) {
       return AttendanceActionResult(
@@ -183,7 +169,7 @@ class AttendanceService {
       );
     }
 
-    // 3. Get the current device position.
+    // Get current device position
     final position = await _getCurrentPosition();
     if (position == null) {
       return const AttendanceActionResult(
@@ -193,7 +179,7 @@ class AttendanceService {
       );
     }
 
-    // 4. Validate coordinates against geofence center/radius on mobile.
+    // Validate device within geofence
     final rangeCheck = await _validateDeviceWithinGeoFence(
       token,
       geoFenceLookup.geoFenceId!,
@@ -206,7 +192,7 @@ class AttendanceService {
       );
     }
 
-    // 5. Face verification is mandatory for geo-fenced shifts.
+    // Face verification is mandatory for geo-fenced shifts
     final profilePicture = await AuthService.getProfilePictureUrl(
       refresh: true,
     );
@@ -228,9 +214,7 @@ class AttendanceService {
       );
     }
 
-    // 6. Call the geofence-aware clock endpoint.
-    //    The backend (fn_clock_in_out_geo) validates that the user is within
-    //    the fence radius and blocks the request if they are outside.
+    // Call geofence-aware endpoint
     return _geoClock(
       token: token,
       shiftId: shiftId,
@@ -241,8 +225,7 @@ class AttendanceService {
     );
   }
 
-  // ── PATH A: Legacy (no geofence) ─────────────────────────────────────────
-
+  // Legacy clock without geofence
   static Future<AttendanceActionResult> _legacyClock(
     String token,
     String shiftId,
@@ -269,10 +252,7 @@ class AttendanceService {
       final Map<String, dynamic> body = _safeDecode(response.body);
       final bool apiSuccess = body['success'] == true;
 
-      // The backend AttendanceService already builds messages like:
-      //   "Clocked in successfully, but you are late by 0h 15m"
-      //   "Clocked out successfully, but you left early by 1h 3m"
-      // We surface those verbatim so the user sees timing info.
+      // Backend already builds timing messages (late/early), we surface them
       final String message =
           (body['message'] as String?) ??
           (action == 'in'
@@ -292,8 +272,7 @@ class AttendanceService {
     }
   }
 
-  // ── PATH B: Geofence-aware clock ─────────────────────────────────────────
-
+  // Geofence-aware clock endpoint
   static Future<AttendanceActionResult> _geoClock({
     required String token,
     required String shiftId,
@@ -327,17 +306,12 @@ class AttendanceService {
 
       final body = _safeDecode(response.body);
 
-      // The GeoFence/clock response wraps the GeoClockInResponse in data:
-      // { success: bool, message: str, data: { success: bool, message: str,
-      //     locationStatus: str, distanceMeters: num, ... } }
+      // Prefer inner message (has distance/violation info)
       final outerSuccess = body['success'] == true;
       final data = body['data'];
       final innerSuccess = data is Map<String, dynamic>
           ? data['success'] == true
           : outerSuccess;
-
-      // Prefer the inner message (set by the DB function — contains distance
-      // info and geofence violation reason), fall back to outer message.
       final String message = _pickBestMessage(data, body, action);
 
       final locationStatus = _extractLocationStatus(data, body);
@@ -378,10 +352,9 @@ class AttendanceService {
         : 'Clocked out successfully.';
   }
 
-  // ── Location helpers ─────────────────────────────────────────────────────
-
+  // Location helpers
   static Future<_LocationCheckResult> _ensureLocationPermission() async {
-    // Is the device's location service (GPS) enabled at all?
+    // Check if GPS is enabled
     final serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
       return _LocationCheckResult(
@@ -503,11 +476,7 @@ class AttendanceService {
     }
   }
 
-  // ── Geofence lookup ──────────────────────────────────────────────────────
-
-  /// Resolves whether the shift has an active geofence and returns its ID.
-  ///
-  /// `resolved=false` means the app could not determine requirement safely.
+  // Check if shift has active geofence
   static Future<_GeoFenceLookupResult> _getGeoFenceRequirementForShift(
     String token,
     String shiftId,
@@ -605,8 +574,7 @@ class AttendanceService {
     return double.tryParse(value.toString());
   }
 
-  // ── General attendance queries (unchanged from original) ─────────────────
-
+  // General attendance queries
   static Future<Map<String, dynamic>?> getTodayAttendance(String token) async {
     final response = await http.get(
       Uri.parse('$baseUrl/today'),
@@ -624,8 +592,7 @@ class AttendanceService {
     String token,
     String employeeId,
   ) async {
-    // Use only the employee-specific shift endpoint. Falling back to an
-    // arbitrary org shift can send attendance against the wrong shift.
+    // Use employee-specific shift endpoint (avoid wrong shift fallback)
     try {
       final response = await http.get(
         Uri.parse('$baseUrl/CurrentShift/$employeeId'),
@@ -756,8 +723,7 @@ class AttendanceService {
     }
   }
 
-  // ── Shift-swap methods (unchanged from original) ─────────────────────────
-
+  // Shift-swap operations
   static Future<AttendanceActionResult> createShiftSwapRequest(
     String token, {
     required String employeeId,
@@ -905,8 +871,7 @@ class AttendanceService {
     return [];
   }
 
-  // ── Utility ──────────────────────────────────────────────────────────────
-
+  // Utility
   static Map<String, dynamic> _safeDecode(String source) {
     try {
       final decoded = jsonDecode(source);
@@ -916,9 +881,7 @@ class AttendanceService {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// Internal helper classes
 
 class _LocationCheckResult {
   final bool granted;

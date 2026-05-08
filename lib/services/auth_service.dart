@@ -31,8 +31,7 @@ class AuthService {
         authResponse.tokenExpiration,
       );
       await saveUserInfo(authResponse);
-      // Fetch and cache role-based permissions right after login so they are
-      // available instantly everywhere in the app without additional calls.
+      // Fetch and cache permissions post-login
       if (authResponse.userId != null && authResponse.userId!.isNotEmpty) {
         await PermissionService.fetchAndStore(authResponse.userId!);
       }
@@ -42,7 +41,7 @@ class AuthService {
     }
   }
 
-  // ── TOKEN STORAGE ──
+  // Token storage
   static Future<void> _saveToken(
     String token,
     String refreshToken,
