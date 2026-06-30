@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../services/auth_service.dart';
 import '../services/permission_service.dart';
 import 'login_screen.dart';
+import 'permissions_debug_screen.dart';
 
 class ProfileScreen extends StatefulWidget {
   const ProfileScreen({super.key});
@@ -71,10 +72,8 @@ class _ProfileScreenState extends State<ProfileScreen> {
     // The action key 'admin_dashboard' under Admin Dashboard → Admin Dashboard
     // is used by the web frontend to gate admin-only features such as editing
     // announcements. We mirror that check here instead of hard-coding roles.
-    final canEdit = await PermissionService.hasActionPermission(
-      'Admin Dashboard',
-      'Admin Dashboard',
-      'admin_dashboard',
+    final canEdit = await PermissionService.hasPermissionByActionKey(
+      PermissionKeys.adminDashboard,
     );
     if (mounted) {
       setState(() => _canEditAnnouncement = canEdit);
@@ -465,6 +464,30 @@ class _ProfileScreenState extends State<ProfileScreen> {
                     const SizedBox(height: 8),
                     _buildAnnouncementEditor(),
                   ],
+                  const SizedBox(height: 12),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 50,
+                    child: OutlinedButton.icon(
+                      onPressed: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => const PermissionsDebugScreen(),
+                          ),
+                        );
+                      },
+                      icon: const Icon(Icons.security),
+                      label: const Text('View My Permissions'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFF2563EB),
+                        side: const BorderSide(color: Color(0xFF2563EB)),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    ),
+                  ),
                   const SizedBox(height: 24),
                   SizedBox(
                     width: double.infinity,

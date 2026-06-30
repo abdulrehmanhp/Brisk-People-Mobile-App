@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../services/attendance_service.dart';
 import '../services/auth_service.dart';
+import '../services/permission_service.dart';
+import '../widgets/permission_gate.dart';
 import 'attendance_history_screen.dart';
 
 class AttendanceScreen extends StatefulWidget {
@@ -33,6 +35,11 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   DateTime? _filterFrom;
   DateTime? _filterTo;
 
+  bool _canClockIn = false;
+  bool _canClockOut = false;
+  bool _canViewRecords = false;
+  bool _permissionsResolved = false;
+
   @override
   void initState() {
     super.initState();
@@ -50,8 +57,33 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
 
   Future<void> _init() async {
     _token = await AuthService.getToken();
+    await _loadPermissionFlags();
     await _loadTodayState();
     await _loadRecentAttendance();
+  }
+
+  Future<void> _loadPermissionFlags() async {
+    final results = await Future.wait([
+      PermissionService.hasPermissionByActionKey(PermissionKeys.clockIn),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.clockOut),
+      PermissionService.hasPermissionByActionKey(
+        PermissionKeys.myAttendanceSummary,
+      ),
+      PermissionService.hasPermissionByActionKey(
+        PermissionKeys.attendanceRecordTable,
+      ),
+      PermissionService.hasPermissionByActionKey(
+        PermissionKeys.recentAttendanceTable,
+      ),
+    ]);
+
+    if (!mounted) return;
+    setState(() {
+      _canClockIn = results[0];
+      _canClockOut = results[1];
+      _canViewRecords = results[2] || results[3] || results[4];
+      _permissionsResolved = true;
+    });
   }
 
   Future<void> _loadTodayState() async {
@@ -213,6 +245,10 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   }
 
   Future<void> _handleClockIn() async {
+    if (!_canClockIn) {
+      _showTopMessage('You do not have permission to clock in.', success: false);
+      return;
+    }
     if (_isSubmitting || (_shiftId ?? '').isEmpty) return;
     setState(() => _isSubmitting = true);
     final result = await AttendanceService.clockIn(_token!, _shiftId!);
@@ -224,6 +260,10 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   }
 
   Future<void> _handleClockOut() async {
+    if (!_canClockOut) {
+      _showTopMessage('You do not have permission to clock out.', success: false);
+      return;
+    }
     if (_isSubmitting || (_shiftId ?? '').isEmpty) return;
     setState(() => _isSubmitting = true);
     final result = await AttendanceService.clockOut(_token!, _shiftId!);
@@ -329,6 +369,16 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
   // ────────────────────── BUILD ──────────────────────
   @override
   Widget build(BuildContext context) {
+    if (!_permissionsResolved) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (!_canClockIn && !_canClockOut && !_canViewRecords) {
+      return const PermissionDeniedScaffold(featureName: 'Attendance');
+    }
+
     final formattedDate =
         DateFormat('EEEE, d MMMM yyyy').format(_currentTime);
     final timeStr = DateFormat('HH : mm : ss').format(_currentTime);
@@ -357,14 +407,18 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
         child: Column(
           children: [
             _buildClockHeader(formattedDate, timeStr),
-            const SizedBox(height: 16),
-            _buildClockButtons(),
-            const SizedBox(height: 20),
-            _buildTodaySessions(),
-            const SizedBox(height: 20),
-            _buildFilterSection(),
-            const SizedBox(height: 20),
-            _buildRecentAttendance(),
+            if (_canClockIn || _canClockOut) ...[
+              const SizedBox(height: 16),
+              _buildClockButtons(),
+            ],
+            if (_canViewRecords) ...[
+              const SizedBox(height: 20),
+              _buildTodaySessions(),
+              const SizedBox(height: 20),
+              _buildFilterSection(),
+              const SizedBox(height: 20),
+              _buildRecentAttendance(),
+            ],
             const SizedBox(height: 24),
           ],
         ),
@@ -458,55 +512,57 @@ class _AttendanceScreenState extends State<AttendanceScreen> {
         child: Column(
           children: [
             // Clock In
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: ElevatedButton.icon(
-                onPressed:
-                    (!_isCheckedIn && !_isSubmitting) ? _handleClockIn : null,
-                icon: const Icon(Icons.login_rounded, size: 20),
-                label: Text(_isSubmitting && !_isCheckedIn
-                    ? 'Clocking In...'
-                    : 'Clock In'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2563EB),
-                  foregroundColor: Colors.white,
-                  disabledBackgroundColor: _isCheckedIn
-                      ? Colors.grey.shade200
-                      : const Color(0xFF2563EB),
-                  disabledForegroundColor:
-                      _isCheckedIn ? Colors.grey.shade400 : Colors.white,
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
-                  elevation: 0,
-                ),
-              ),
-            ),
-            const SizedBox(height: 12),
-            // Clock Out
-            SizedBox(
-              width: double.infinity,
-              height: 48,
-              child: OutlinedButton.icon(
-                onPressed:
-                    (_isCheckedIn && !_isSubmitting) ? _handleClockOut : null,
-                icon: const Icon(Icons.logout_rounded, size: 20),
-                label: Text(_isSubmitting && _isCheckedIn
-                    ? 'Clocking Out...'
-                    : 'Clock Out'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor:
-                      _isCheckedIn ? Colors.grey.shade700 : Colors.grey.shade300,
-                  side: BorderSide(
-                    color: _isCheckedIn
-                        ? Colors.grey.shade300
-                        : Colors.grey.shade200,
+            if (_canClockIn)
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: ElevatedButton.icon(
+                  onPressed:
+                      (!_isCheckedIn && !_isSubmitting) ? _handleClockIn : null,
+                  icon: const Icon(Icons.login_rounded, size: 20),
+                  label: Text(_isSubmitting && !_isCheckedIn
+                      ? 'Clocking In...'
+                      : 'Clock In'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF2563EB),
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: _isCheckedIn
+                        ? Colors.grey.shade200
+                        : const Color(0xFF2563EB),
+                    disabledForegroundColor:
+                        _isCheckedIn ? Colors.grey.shade400 : Colors.white,
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12)),
+                    elevation: 0,
                   ),
-                  shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
                 ),
               ),
-            ),
+            if (_canClockIn && _canClockOut) const SizedBox(height: 12),
+            // Clock Out
+            if (_canClockOut)
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: OutlinedButton.icon(
+                  onPressed:
+                      (_isCheckedIn && !_isSubmitting) ? _handleClockOut : null,
+                  icon: const Icon(Icons.logout_rounded, size: 20),
+                  label: Text(_isSubmitting && _isCheckedIn
+                      ? 'Clocking Out...'
+                      : 'Clock Out'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor:
+                        _isCheckedIn ? Colors.grey.shade700 : Colors.grey.shade300,
+                    side: BorderSide(
+                      color: _isCheckedIn
+                          ? Colors.grey.shade300
+                          : Colors.grey.shade200,
+                    ),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12)),
+                  ),
+                ),
+              ),
           ],
         ),
       ),

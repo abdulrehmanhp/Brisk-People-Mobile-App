@@ -3,6 +3,8 @@ import 'package:intl/intl.dart';
 
 import '../services/attendance_service.dart';
 import '../services/auth_service.dart';
+import '../services/permission_service.dart';
+import '../widgets/permission_gate.dart';
 
 class ShiftSwapScreen extends StatefulWidget {
   final bool openCreateSheetOnLoad;
@@ -25,8 +27,11 @@ class _ShiftSwapScreenState extends State<ShiftSwapScreen> {
   bool _hasAutoOpened = false;
   String? _token;
   String _userId = '';
-  String _role = '';
   String? _currentShiftId;
+
+  bool _canCreateSwap = false;
+  bool _canManageTeam = false;
+  bool _permissionsResolved = false;
 
   int _segmentIndex = 0;
 
@@ -36,11 +41,6 @@ class _ShiftSwapScreenState extends State<ShiftSwapScreen> {
 
   final Set<String> _processingIds = <String>{};
   bool _isSheetOpen = false;
-
-  bool get _canManageTeam {
-    final r = _role.toLowerCase();
-    return r.contains('manager') || r.contains('admin') || r.contains('hr');
-  }
 
   @override
   void initState() {
@@ -54,7 +54,8 @@ class _ShiftSwapScreenState extends State<ShiftSwapScreen> {
     _token ??= await AuthService.getToken();
     final info = await AuthService.getUserInfo();
     _userId = (info['userId'] ?? '').trim();
-    _role = (info['role'] ?? '').trim();
+
+    await _loadPermissionFlags();
 
     if (_token == null || _token!.isEmpty || _userId.isEmpty) {
       if (!mounted) return;
@@ -97,12 +98,33 @@ class _ShiftSwapScreenState extends State<ShiftSwapScreen> {
       _isLoading = false;
     });
 
-    if (widget.openCreateSheetOnLoad && !_hasAutoOpened) {
+    if (widget.openCreateSheetOnLoad && !_hasAutoOpened && _canCreateSwap) {
       _hasAutoOpened = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _openCreateShiftSwapSheet();
       });
     }
+  }
+
+  Future<void> _loadPermissionFlags() async {
+    final results = await Future.wait([
+      PermissionService.hasPermissionByActionKey(
+        PermissionKeys.createShiftSwapRequest,
+      ),
+      PermissionService.hasPermissionByActionKey(
+        PermissionKeys.teamShiftSwapTable,
+      ),
+    ]);
+
+    if (!mounted) return;
+    setState(() {
+      _canCreateSwap = results[0];
+      _canManageTeam = results[1];
+      _permissionsResolved = true;
+      if (!_canManageTeam && _segmentIndex == 1) {
+        _segmentIndex = 0;
+      }
+    });
   }
 
   void _showMessage(String msg, {bool isError = false}) {
@@ -166,6 +188,13 @@ class _ShiftSwapScreenState extends State<ShiftSwapScreen> {
   }
 
   Future<void> _openCreateShiftSwapSheet() async {
+    if (!_canCreateSwap) {
+      _showMessage(
+        'You do not have permission to create shift swap requests.',
+        isError: true,
+      );
+      return;
+    }
     if (_isSheetOpen) return;
     _isSheetOpen = true;
 
@@ -442,6 +471,18 @@ class _ShiftSwapScreenState extends State<ShiftSwapScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_permissionsResolved) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (!_canCreateSwap && !_canManageTeam) {
+      return const PermissionDeniedScaffold(
+        featureName: 'Shift Swap',
+      );
+    }
+
     return Scaffold(
       backgroundColor: const Color(0xFFF3F5F8),
       appBar: AppBar(
@@ -464,18 +505,19 @@ class _ShiftSwapScreenState extends State<ShiftSwapScreen> {
         ),
         centerTitle: true,
         actions: [
-          IconButton(
-            onPressed: _openCreateShiftSwapSheet,
-            icon: Container(
-              width: 42,
-              height: 42,
-              decoration: const BoxDecoration(
-                color: Color(0xFFE6ECF7),
-                shape: BoxShape.circle,
+          if (_canCreateSwap)
+            IconButton(
+              onPressed: _openCreateShiftSwapSheet,
+              icon: Container(
+                width: 42,
+                height: 42,
+                decoration: const BoxDecoration(
+                  color: Color(0xFFE6ECF7),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.add, color: Color(0xFF8E44AD), size: 28),
               ),
-              child: const Icon(Icons.add, color: Color(0xFF8E44AD), size: 28),
             ),
-          ),
           const SizedBox(width: 8),
         ],
       ),

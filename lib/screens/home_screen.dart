@@ -11,6 +11,7 @@ import 'profile_screen.dart';
 import 'attendance_screen.dart';
 import 'attendance_history_screen.dart';
 import 'leave_screen.dart';
+import 'payroll_screen.dart';
 import 'shift_swap_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -58,16 +59,41 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   List<LeaveRequestItem> _pendingLeaveApprovals = [];
   List<ShiftSwapRequestItem> _pendingShiftSwapApprovals = [];
-  // Whether the user can approve team leave/shift-swap requests.
+  // Whether the user can approve team leave requests (action key:
+  // 'team_leave_approve' under Leave Management -> Team Leaves).
   // Resolved from the permissions API — no role strings here.
   bool _canApproveRequests = false;
+  // Whether the user can see/manage team shift-swap requests (action key:
+  // 'TEAM_SHIFT_SWAP_TABLE' under Attendance -> Shifts). This is a SEPARATE
+  // permission from leave approval — a role can have one without the other,
+  // so they must never be conflated into a single flag.
+  bool _canManageTeamShiftSwaps = false;
+
+  // Quick Action visibility — each mirrors the exact action key the web app
+  // checks for the same feature (see PermissionKeys for the full mapping).
+  bool _canClockIn = false;
+  bool _canClockOut = false;
+  bool _canApplyLeave = false;
+  bool _canViewPayslip = false;
+  bool _canCreateShiftSwap = false;
+  bool _canViewMyAttendanceSummary = false;
+  // Becomes true once the permission flags above have been resolved at
+  // least once, so the Quick Actions grid doesn't flash "nothing" before
+  // the very first permission check completes.
+  bool _quickActionsResolved = false;
+
   String _announcementTitle = 'Office closed on 23 March';
   String _announcementBody = 'Public Holiday observation. Enjoy your day off!';
+
+  StreamSubscription<int>? _permissionSubscription;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _permissionSubscription = PermissionService.onChanged.listen((_) {
+      if (mounted) reloadPermissions();
+    });
     _timer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) {
         setState(() => _currentTime = DateTime.now());
@@ -92,6 +118,7 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
+    _permissionSubscription?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _timer.cancel();
     _approvalRefreshTimer?.cancel();
@@ -133,19 +160,49 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       setState(() => _profileImageUrl = refreshed);
     }
 
-    // Resolve approval capability from the permissions API.
-    // We check 'team_leave_approve' under Leave Management -> Team Leaves,
-    // which is exactly what the web frontend uses to gate manager-level access.
-    final canApprove = await PermissionService.hasActionPermission(
-      'Leave Management',
-      'Team Leaves',
-      'team_leave_approve',
-    );
-    if (mounted) {
-      setState(() => _canApproveRequests = canApprove);
-    }
+    // Resolve every role-gated capability used on this screen from the
+    // permissions API — mirrors exactly what the web app's sidebar/components
+    // check for the same features (see PermissionKeys for the key mapping
+    // and reasoning). No hard-coded role-name strings anywhere here.
+    await _loadPermissionFlags();
 
     await _loadPendingApprovals();
+  }
+
+  /// Called when permissions change live (SignalR) or on parent refresh.
+  Future<void> reloadPermissions() async {
+    await _loadPermissionFlags();
+    await _loadPendingApprovals();
+    if (mounted) setState(() {});
+  }
+
+  /// Resolves all permission-gated UI flags used by this screen. Safe to
+  /// call repeatedly (e.g. on app resume) to pick up role changes made by a
+  /// superadmin without requiring the employee to log out.
+  Future<void> _loadPermissionFlags() async {
+    final results = await Future.wait([
+      PermissionService.hasPermissionByActionKey(PermissionKeys.teamLeaveApprove),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.teamShiftSwapTable),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.clockIn),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.clockOut),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.myLeaveRequestLeave),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.myPayslip),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.createShiftSwapRequest),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.myAttendanceSummary),
+    ]);
+
+    if (!mounted) return;
+    setState(() {
+      _canApproveRequests = results[0];
+      _canManageTeamShiftSwaps = results[1];
+      _canClockIn = results[2];
+      _canClockOut = results[3];
+      _canApplyLeave = results[4];
+      _canViewPayslip = results[5];
+      _canCreateShiftSwap = results[6];
+      _canViewMyAttendanceSummary = results[7];
+      _quickActionsResolved = true;
+    });
   }
 
   Future<void> _refreshProfilePicture() async {
@@ -340,49 +397,60 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
       _role = info['role'] ?? '';
     }
 
-    // Re-check permission flag in case it wasn't loaded yet (e.g. on timer
-    // refresh before _loadUserInfo completes on first launch).
-    if (!_canApproveRequests) {
-      final canApprove = await PermissionService.hasActionPermission(
-        'Leave Management',
-        'Team Leaves',
-        'team_leave_approve',
-      );
-      if (mounted && canApprove != _canApproveRequests) {
-        setState(() => _canApproveRequests = canApprove);
+    // Re-check permission flags in case they weren't loaded yet (e.g. on a
+    // timer refresh that fires before _loadUserInfo finishes on first
+    // launch). These two capabilities are governed by DIFFERENT permissions
+    // on the web app ('team_leave_approve' vs 'TEAM_SHIFT_SWAP_TABLE') and
+    // must stay independent — a role can have one without the other.
+    if (!_canApproveRequests || !_canManageTeamShiftSwaps) {
+      final results = await Future.wait([
+        PermissionService.hasPermissionByActionKey(
+          PermissionKeys.teamLeaveApprove,
+        ),
+        PermissionService.hasPermissionByActionKey(
+          PermissionKeys.teamShiftSwapTable,
+        ),
+      ]);
+      if (mounted &&
+          (results[0] != _canApproveRequests ||
+              results[1] != _canManageTeamShiftSwaps)) {
+        setState(() {
+          _canApproveRequests = results[0];
+          _canManageTeamShiftSwaps = results[1];
+        });
       }
     }
 
-    final futures = <Future<dynamic>>[];
-    if (_canApproveRequests) {
-      futures.add(
-        LeaveService.getTeamLeaveRequests(_token!, currentEmployeeId: _userId),
-      );
-      futures.add(AttendanceService.getPendingShiftSwapRequests(_token!));
-    } else {
-      futures.add(
-        LeaveService.getMyLeaveRequests(_token!, currentEmployeeId: _userId),
-      );
-      futures.add(
-        AttendanceService.getShiftSwapRequestsByEmployee(_token!, _userId),
-      );
-    }
+    final leaveFuture = _canApproveRequests
+        ? LeaveService.getTeamLeaveRequests(_token!, currentEmployeeId: _userId)
+        : LeaveService.getMyLeaveRequests(_token!, currentEmployeeId: _userId);
+    final swapFuture = _canManageTeamShiftSwaps
+        ? AttendanceService.getPendingShiftSwapRequests(_token!)
+        : AttendanceService.getShiftSwapRequestsByEmployee(_token!, _userId);
 
-    final values = await Future.wait<dynamic>(futures);
-    List<LeaveRequestItem> pendingLeaves;
-    List<ShiftSwapRequestItem> pendingSwaps;
+    final results = await Future.wait<dynamic>([leaveFuture, swapFuture]);
+    final leaveResult = results[0] as List<LeaveRequestItem>;
+    final swapResult = results[1] as List<ShiftSwapRequestItem>;
 
-    if (_canApproveRequests) {
-      pendingLeaves = values[0] as List<LeaveRequestItem>;
-      pendingSwaps = values[1] as List<ShiftSwapRequestItem>;
-      await _notifyManagerForNewPendingRequests(pendingLeaves, pendingSwaps);
-    } else {
-      final myLeaves = values[0] as List<LeaveRequestItem>;
-      final mySwaps = values[1] as List<ShiftSwapRequestItem>;
-      pendingLeaves = myLeaves.where((e) => e.isPending).toList();
-      pendingSwaps = mySwaps.where((e) => e.isPending).toList();
-      await _notifyEmployeeForDecisionUpdates(myLeaves, mySwaps);
-    }
+    final pendingLeaves = _canApproveRequests
+        ? leaveResult
+        : leaveResult.where((e) => e.isPending).toList();
+    final pendingSwaps = _canManageTeamShiftSwaps
+        ? swapResult
+        : swapResult.where((e) => e.isPending).toList();
+
+    // Each notification helper only cares about the list relevant to its own
+    // role (manager vs employee) — pass an empty list for whichever
+    // perspective doesn't apply so a non-manager never gets "new team
+    // request" notifications, and vice versa.
+    await _notifyManagerForNewPendingRequests(
+      _canApproveRequests ? pendingLeaves : const <LeaveRequestItem>[],
+      _canManageTeamShiftSwaps ? pendingSwaps : const <ShiftSwapRequestItem>[],
+    );
+    await _notifyEmployeeForDecisionUpdates(
+      _canApproveRequests ? const <LeaveRequestItem>[] : leaveResult,
+      _canManageTeamShiftSwaps ? const <ShiftSwapRequestItem>[] : swapResult,
+    );
 
     if (!mounted) return;
     setState(() {
@@ -555,6 +623,15 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   Future<void> handleAttendance() async {
     if (_isSubmitting) return;
+
+    final canAct = isCheckedIn ? _canClockOut : _canClockIn;
+    if (!canAct) {
+      _showTopMessage(
+        'You do not have permission to ${isCheckedIn ? 'clock out' : 'clock in'}.',
+        success: false,
+      );
+      return;
+    }
 
     if (mounted) setState(() => _isSubmitting = true);
 
@@ -1181,6 +1258,138 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // ── QUICK ACTIONS ──
   Widget _buildQuickActions() {
+    if (!_quickActionsResolved) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 24),
+        child: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    final canClock = isCheckedIn ? _canClockOut : _canClockIn;
+    final cards = <Widget>[];
+
+    if (canClock) {
+      cards.add(
+        _buildActionCard(
+          icon: Icons.access_time_filled,
+          label: _isSubmitting
+              ? 'Processing...'
+              : (isCheckedIn ? 'Clock Out' : 'Clock In'),
+          subtitle: _isSubmitting
+              ? 'Please wait'
+              : (isCheckedIn ? 'Tap to check out' : 'Tap to check in'),
+          color: const Color(0xFFDCE8FF),
+          iconColor: const Color(0xFF2563EB),
+          onTap: _isSubmitting ? null : handleAttendance,
+        ),
+      );
+    }
+
+    if (_canApplyLeave) {
+      cards.add(
+        _buildActionCard(
+          icon: Icons.calendar_today,
+          label: 'Apply Leave',
+          subtitle: 'Request time off',
+          color: const Color(0xFFD5F5E3),
+          iconColor: const Color(0xFF27AE60),
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => const LeaveScreen(
+                  openApplySheetOnLoad: true,
+                  showBackButton: true,
+                ),
+              ),
+            ).then((_) => _loadPendingApprovals());
+          },
+        ),
+      );
+    }
+
+    if (_canViewPayslip) {
+      cards.add(
+        _buildActionCard(
+          icon: Icons.receipt_long,
+          label: 'Payslip',
+          subtitle: 'View salary slip',
+          color: const Color(0xFFFFF3CD),
+          iconColor: const Color(0xFFF39C12),
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const PayrollScreen()),
+            );
+          },
+        ),
+      );
+    }
+
+    if (_canCreateShiftSwap) {
+      cards.add(
+        _buildActionCard(
+          icon: Icons.swap_horiz,
+          label: 'Shift Swap',
+          subtitle: 'Create request',
+          color: const Color(0xFFF0E0FF),
+          iconColor: const Color(0xFF8E44AD),
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => const ShiftSwapScreen(
+                  openCreateSheetOnLoad: true,
+                  showBackButton: true,
+                ),
+              ),
+            ).then((_) => _loadPendingApprovals());
+          },
+        ),
+      );
+    }
+
+    if (_canViewMyAttendanceSummary) {
+      cards.add(
+        _buildActionCard(
+          icon: Icons.assignment_outlined,
+          label: 'My Attendance',
+          subtitle: 'View full records',
+          color: const Color(0xFFE0F7FA),
+          iconColor: const Color(0xFF00838F),
+          onTap: () => Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const AttendanceScreen()),
+          ).then((_) {
+            loadTodayAttendance();
+            _loadWeeklyAttendance();
+          }),
+        ),
+      );
+    }
+
+    if (cards.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    final rows = <Widget>[];
+    for (var i = 0; i < cards.length; i += 2) {
+      final left = cards[i];
+      final right = i + 1 < cards.length ? cards[i + 1] : null;
+      rows.add(
+        Row(
+          children: [
+            Expanded(child: left),
+            const SizedBox(width: 12),
+            Expanded(child: right ?? const SizedBox.shrink()),
+          ],
+        ),
+      );
+      if (i + 2 < cards.length) {
+        rows.add(const SizedBox(height: 12));
+      }
+    }
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1189,109 +1398,7 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
           style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
         const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: _buildActionCard(
-                icon: Icons.access_time_filled,
-                label: _isSubmitting
-                    ? 'Processing...'
-                    : (isCheckedIn ? 'Clock Out' : 'Clock In'),
-                subtitle: _isSubmitting
-                    ? 'Please wait'
-                    : (isCheckedIn ? 'Tap to check out' : 'Tap to check in'),
-                color: const Color(0xFFDCE8FF),
-                iconColor: const Color(0xFF2563EB),
-                onTap: _isSubmitting ? null : handleAttendance,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _buildActionCard(
-                icon: Icons.calendar_today,
-                label: 'Apply Leave',
-                subtitle: 'Request time off',
-                color: const Color(0xFFD5F5E3),
-                iconColor: const Color(0xFF27AE60),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => const LeaveScreen(
-                        openApplySheetOnLoad: true,
-                        showBackButton: true,
-                      ),
-                    ),
-                  ).then((_) {
-                    _loadPendingApprovals();
-                  });
-                },
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: _buildActionCard(
-                icon: Icons.receipt_long,
-                label: 'Payslip',
-                subtitle: 'View salary slip',
-                color: const Color(0xFFFFF3CD),
-                iconColor: const Color(0xFFF39C12),
-                onTap: () {},
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _buildActionCard(
-                icon: Icons.swap_horiz,
-                label: 'Shift Swap',
-                subtitle: 'Create request',
-                color: const Color(0xFFF0E0FF),
-                iconColor: const Color(0xFF8E44AD),
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => const ShiftSwapScreen(
-                        openCreateSheetOnLoad: true,
-                        showBackButton: true,
-                      ),
-                    ),
-                  ).then((_) => _loadPendingApprovals());
-                },
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        Row(
-          children: [
-            Expanded(
-              child: _buildActionCard(
-                icon: Icons.assignment_outlined,
-                label: 'My Attendance',
-                subtitle: 'View full records',
-                color: const Color(0xFFE0F7FA),
-                iconColor: const Color(0xFF00838F),
-                onTap: () =>
-                    Navigator.push(
-                      context,
-                      MaterialPageRoute(
-                        builder: (_) => const AttendanceScreen(),
-                      ),
-                    ).then((_) {
-                      loadTodayAttendance();
-                      _loadWeeklyAttendance();
-                    }),
-              ),
-            ),
-            const SizedBox(width: 12),
-            const Expanded(child: SizedBox()),
-          ],
-        ),
+        ...rows,
       ],
     );
   }
@@ -1546,14 +1653,79 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
 
   // ── PENDING APPROVALS ──
   Widget _buildPendingApprovals() {
+    final showLeaveRow =
+        _canApproveRequests || _canApplyLeave;
+    final showSwapRow =
+        _canManageTeamShiftSwaps || _canCreateShiftSwap;
+
+    if (!showLeaveRow && !showSwapRow) {
+      return const SizedBox.shrink();
+    }
+
     final leaveCount = _pendingLeaveApprovals.length;
     final swapCount = _pendingShiftSwapApprovals.length;
     final leaveTitle = _canApproveRequests
         ? 'Leave Request Pending'
         : 'My Pending Leave Requests';
-    final swapTitle = _canApproveRequests
+    final swapTitle = _canManageTeamShiftSwaps
         ? 'Shift Swap Request Pending'
         : 'My Pending Shift Swaps';
+
+    final items = <Widget>[];
+
+    if (showLeaveRow) {
+      items.add(
+        _buildApprovalItem(
+          icon: Icons.calendar_month,
+          iconBg: const Color(0xFFDCE8FF),
+          iconColor: const Color(0xFF2563EB),
+          title: leaveTitle,
+          subtitle: leaveCount == 0
+              ? 'No pending leave requests'
+              : '$leaveCount pending leave request${leaveCount == 1 ? '' : 's'}',
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => LeaveScreen(
+                  showBackButton: true,
+                  initialSegmentIndex: _canApproveRequests ? 1 : 0,
+                ),
+              ),
+            ).then((_) => _loadPendingApprovals());
+          },
+        ),
+      );
+    }
+
+    if (showLeaveRow && showSwapRow) {
+      items.add(Divider(height: 1, color: Colors.grey.shade200));
+    }
+
+    if (showSwapRow) {
+      items.add(
+        _buildApprovalItem(
+          icon: Icons.swap_horiz,
+          iconBg: const Color(0xFFF0E0FF),
+          iconColor: const Color(0xFF8E44AD),
+          title: swapTitle,
+          subtitle: swapCount == 0
+              ? 'No pending shift swap requests'
+              : '$swapCount pending shift swap request${swapCount == 1 ? '' : 's'}',
+          onTap: () {
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => ShiftSwapScreen(
+                  showBackButton: true,
+                  initialSegmentIndex: _canManageTeamShiftSwaps ? 1 : 0,
+                ),
+              ),
+            ).then((_) => _loadPendingApprovals());
+          },
+        ),
+      );
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1575,51 +1747,7 @@ class HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
               ),
             ],
           ),
-          child: Column(
-            children: [
-              _buildApprovalItem(
-                icon: Icons.calendar_month,
-                iconBg: const Color(0xFFDCE8FF),
-                iconColor: const Color(0xFF2563EB),
-                title: leaveTitle,
-                subtitle: leaveCount == 0
-                    ? 'No pending leave requests'
-                    : '$leaveCount pending leave request${leaveCount == 1 ? '' : 's'}',
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => LeaveScreen(
-                        showBackButton: true,
-                        initialSegmentIndex: _canApproveRequests ? 1 : 0,
-                      ),
-                    ),
-                  ).then((_) => _loadPendingApprovals());
-                },
-              ),
-              Divider(height: 1, color: Colors.grey.shade200),
-              _buildApprovalItem(
-                icon: Icons.swap_horiz,
-                iconBg: const Color(0xFFF0E0FF),
-                iconColor: const Color(0xFF8E44AD),
-                title: swapTitle,
-                subtitle: swapCount == 0
-                    ? 'No pending shift swap requests'
-                    : '$swapCount pending shift swap request${swapCount == 1 ? '' : 's'}',
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => ShiftSwapScreen(
-                        showBackButton: true,
-                        initialSegmentIndex: _canApproveRequests ? 1 : 0,
-                      ),
-                    ),
-                  ).then((_) => _loadPendingApprovals());
-                },
-              ),
-            ],
-          ),
+          child: Column(children: items),
         ),
       ],
     );

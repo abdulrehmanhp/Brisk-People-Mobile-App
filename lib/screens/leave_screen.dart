@@ -3,6 +3,8 @@ import 'package:intl/intl.dart';
 
 import '../services/auth_service.dart';
 import '../services/leave_service.dart';
+import '../services/permission_service.dart';
+import '../widgets/permission_gate.dart';
 
 class LeaveScreen extends StatefulWidget {
   final bool openApplySheetOnLoad;
@@ -26,8 +28,13 @@ class _LeaveScreenState extends State<LeaveScreen> {
   bool _isApplySheetOpen = false;
   String? _token;
   String? _userId;
-  String _roleName = '';
-  bool _canManageTeam = false;
+  bool _canApplyLeave = false;
+  bool _canCancelLeave = false;
+  bool _canViewMyLeaves = false;
+  bool _canViewTeamRequests = false;
+  bool _canApproveTeam = false;
+  bool _canRejectTeam = false;
+  bool _permissionsResolved = false;
 
   int _segmentIndex = 0; // 0 My Requests, 1 Team Requests, 2 Calendar
   int _historyFilter = 0; // 0 all, 1 this month, 2 last 3 months
@@ -58,20 +65,17 @@ class _LeaveScreenState extends State<LeaveScreen> {
   Future<void> _loadData() async {
     setState(() => _isLoading = true);
     _token ??= await AuthService.getToken();
-    if ((_userId ?? '').isEmpty || _roleName.isEmpty) {
+    if ((_userId ?? '').isEmpty) {
       final userInfo = await AuthService.getUserInfo();
       _userId = (userInfo['userId'] ?? '').trim();
-      _roleName = (userInfo['role'] ?? '').trim();
-      final role = _roleName.toLowerCase();
-      _canManageTeam =
-          role.contains('manager') ||
-          role.contains('admin') ||
-          role.contains('hr');
     }
+
+    await _loadPermissionFlags();
+
     if (_token == null || _token!.isEmpty) {
       if (mounted) {
         setState(() => _isLoading = false);
-        _showMessage('Session expired. Please loqgin again.', isError: true);
+        _showMessage('Session expired. Please login again.', isError: true);
       }
       return;
     }
@@ -80,7 +84,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
       LeaveService.getLeaveTypesForRequest(_token!),
       LeaveService.getMyLeaveRequests(_token!, currentEmployeeId: _userId),
     ];
-    if (_canManageTeam) {
+    if (_canViewTeamRequests) {
       futures.add(
         LeaveService.getTeamLeaveRequests(_token!, currentEmployeeId: _userId),
       );
@@ -89,7 +93,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
     final results = await Future.wait<dynamic>(futures);
     final types = results[0] as List<LeaveTypeItem>;
     final history = results[1] as List<LeaveRequestItem>;
-    final teamHistory = _canManageTeam
+    final teamHistory = _canViewTeamRequests
         ? (results[2] as List<LeaveRequestItem>)
         : <LeaveRequestItem>[];
 
@@ -115,13 +119,50 @@ class _LeaveScreenState extends State<LeaveScreen> {
     // Open apply sheet only after leave types are available.
     if (widget.openApplySheetOnLoad &&
         !_hasAutoOpenedApplySheet &&
-        _leaveTypes.isNotEmpty) {
+        _leaveTypes.isNotEmpty &&
+        _canApplyLeave) {
       _hasAutoOpenedApplySheet = true;
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted) return;
         _openApplyLeaveSheet();
       });
     }
+  }
+
+  Future<void> _loadPermissionFlags() async {
+    final results = await Future.wait([
+      PermissionService.hasPermissionByActionKey(
+        PermissionKeys.myLeaveRequestLeave,
+      ),
+      PermissionService.hasPermissionByActionKey(
+        PermissionKeys.myLeaveCancelRequest,
+      ),
+      PermissionService.hasSubMenuPermission(
+        'Leave Management',
+        'My Leaves',
+      ),
+      PermissionService.hasSubMenuPermission(
+        'Leave Management',
+        'Team Requests',
+        aliases: const ['Team Leaves'],
+      ),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.teamLeaveApprove),
+      PermissionService.hasPermissionByActionKey(PermissionKeys.teamLeaveReject),
+    ]);
+
+    if (!mounted) return;
+    setState(() {
+      _canApplyLeave = results[0];
+      _canCancelLeave = results[1];
+      _canViewMyLeaves = results[2] || results[0];
+      _canViewTeamRequests = results[3] || results[4] || results[5];
+      _canApproveTeam = results[4];
+      _canRejectTeam = results[5];
+      _permissionsResolved = true;
+      if (!_canViewTeamRequests && _segmentIndex == 1) {
+        _segmentIndex = 0;
+      }
+    });
   }
 
   List<LeaveRequestItem> get _filteredRequests {
@@ -188,6 +229,10 @@ class _LeaveScreenState extends State<LeaveScreen> {
   }
 
   Future<void> _openApplyLeaveSheet() async {
+    if (!_canApplyLeave) {
+      _showMessage('You do not have permission to apply for leave.', isError: true);
+      return;
+    }
     if (_isApplySheetOpen) return;
     _isApplySheetOpen = true;
 
@@ -636,6 +681,21 @@ class _LeaveScreenState extends State<LeaveScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_permissionsResolved) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    final hasAnyLeaveAccess =
+        _canApplyLeave || _canViewTeamRequests || _canViewMyLeaves;
+    if (!hasAnyLeaveAccess) {
+      return const PermissionDeniedScaffold(featureName: 'Leave Management');
+    }
+
+    final isCalendar = _segmentIndex == _calendarSegmentIndex;
+    final isTeam = _canViewTeamRequests && _segmentIndex == 1;
+
     return Scaffold(
       backgroundColor: const Color(0xFFF3F5F8),
       appBar: AppBar(
@@ -649,9 +709,9 @@ class _LeaveScreenState extends State<LeaveScreen> {
               )
             : null,
         title: Text(
-          _segmentIndex == 2
+          isCalendar
               ? 'Leave Calendar'
-              : (_segmentIndex == 1 ? 'Team Requests' : 'Leave History'),
+              : (isTeam ? 'Team Requests' : 'Leave History'),
           style: const TextStyle(
             color: Color(0xFF0B132B),
             fontSize: 19,
@@ -660,18 +720,19 @@ class _LeaveScreenState extends State<LeaveScreen> {
         ),
         centerTitle: true,
         actions: [
-          IconButton(
-            onPressed: _openApplyLeaveSheet,
-            icon: Container(
-              width: 42,
-              height: 42,
-              decoration: const BoxDecoration(
-                color: Color(0xFFE6ECF7),
-                shape: BoxShape.circle,
+          if (_canApplyLeave)
+            IconButton(
+              onPressed: _openApplyLeaveSheet,
+              icon: Container(
+                width: 42,
+                height: 42,
+                decoration: const BoxDecoration(
+                  color: Color(0xFFE6ECF7),
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(Icons.add, color: Color(0xFF2563EB), size: 28),
               ),
-              child: const Icon(Icons.add, color: Color(0xFF2563EB), size: 28),
             ),
-          ),
           const SizedBox(width: 8),
         ],
       ),
@@ -690,8 +751,8 @@ class _LeaveScreenState extends State<LeaveScreen> {
                     _buildTopSegment(),
                     const SizedBox(height: 16),
                     if (_segmentIndex == 0) _buildMyRequestsTab(),
-                    if (_segmentIndex == 1) _buildTeamRequestsTab(),
-                    if (_segmentIndex == 2) _buildCalendarTab(),
+                    if (isTeam) _buildTeamRequestsTab(),
+                    if (isCalendar) _buildCalendarTab(),
                   ],
                 ),
               ),
@@ -746,7 +807,10 @@ class _LeaveScreenState extends State<LeaveScreen> {
   }
 
   Widget _buildTopSegment() {
-    const labels = ['My Requests', 'Team Requests', 'Calendar'];
+    final labels = <String>['My Requests'];
+    if (_canViewTeamRequests) labels.add('Team Requests');
+    labels.add('Calendar');
+
     return Container(
       padding: const EdgeInsets.all(6),
       decoration: BoxDecoration(
@@ -774,7 +838,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
                   style: TextStyle(
                     color: selected ? Colors.white : const Color(0xFF5B6B84),
                     fontWeight: FontWeight.w700,
-                    fontSize: 15,
+                    fontSize: labels.length > 2 ? 13 : 15,
                   ),
                 ),
               ),
@@ -784,6 +848,8 @@ class _LeaveScreenState extends State<LeaveScreen> {
       ),
     );
   }
+
+  int get _calendarSegmentIndex => _canViewTeamRequests ? 2 : 1;
 
   Widget _buildMyRequestsTab() {
     final grouped = <String, List<LeaveRequestItem>>{};
@@ -824,20 +890,21 @@ class _LeaveScreenState extends State<LeaveScreen> {
                 style: TextStyle(color: Colors.white70, fontSize: 14),
               ),
               const SizedBox(height: 14),
-              ElevatedButton(
-                onPressed: _openApplyLeaveSheet,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.white,
-                  foregroundColor: const Color(0xFF2563EB),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16),
+              if (_canApplyLeave)
+                ElevatedButton(
+                  onPressed: _openApplyLeaveSheet,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.white,
+                    foregroundColor: const Color(0xFF2563EB),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                  ),
+                  child: const Text(
+                    'Apply',
+                    style: TextStyle(fontWeight: FontWeight.w700),
                   ),
                 ),
-                child: const Text(
-                  'Apply',
-                  style: TextStyle(fontWeight: FontWeight.w700),
-                ),
-              ),
             ],
           ),
         ),
@@ -1018,7 +1085,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
         .where((e) => e.leaveTypeId == item.leaveTypeId)
         .map(_typeColor)
         .fold<Color>(const Color(0xFF9FB3CF), (_, c) => c);
-    final canCancel = item.isPending;
+    final canCancel = item.isPending && _canCancelLeave;
     final isCancelling = _cancellingRequestIds.contains(item.requestId);
 
     return Container(
@@ -1264,7 +1331,7 @@ class _LeaveScreenState extends State<LeaveScreen> {
         borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
       ),
       builder: (ctx) {
-        final canCancel = item.isPending;
+        final canCancel = item.isPending && _canCancelLeave;
         final isCancelling = _cancellingRequestIds.contains(item.requestId);
         final rows = [
           ['Request ID', item.requestId],
@@ -1476,9 +1543,9 @@ class _LeaveScreenState extends State<LeaveScreen> {
   }
 
   Widget _buildTeamRequestsTab() {
-    if (!_canManageTeam) {
+    if (!_canViewTeamRequests) {
       return _buildEmptyState(
-        'Team requests are available for Manager/Admin roles only.',
+        'You do not have permission to view team leave requests.',
       );
     }
 
@@ -1612,54 +1679,62 @@ class _LeaveScreenState extends State<LeaveScreen> {
             ),
           ],
           const SizedBox(height: 10),
-          Row(
-            children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: isActing
-                      ? null
-                      : () => _confirmRejectTeamRequest(item),
-                  icon: const Icon(Icons.close_rounded),
-                  label: const Text('Reject'),
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: const Color(0xFFB42318),
-                    side: const BorderSide(color: Color(0xFFFCA5A5)),
-                    minimumSize: const Size.fromHeight(44),
+          if (_canRejectTeam || _canApproveTeam)
+            Row(
+              children: [
+                if (_canRejectTeam)
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: isActing
+                          ? null
+                          : () => _confirmRejectTeamRequest(item),
+                      icon: const Icon(Icons.close_rounded),
+                      label: const Text('Reject'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: const Color(0xFFB42318),
+                        side: const BorderSide(color: Color(0xFFFCA5A5)),
+                        minimumSize: const Size.fromHeight(44),
+                      ),
+                    ),
                   ),
-                ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: isActing
-                      ? null
-                      : () => _confirmApproveTeamRequest(item),
-                  icon: isActing
-                      ? const SizedBox(
-                          width: 14,
-                          height: 14,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
-                          ),
-                        )
-                      : const Icon(Icons.check_rounded),
-                  label: Text(isActing ? 'Processing...' : 'Approve'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF0F766E),
-                    foregroundColor: Colors.white,
-                    minimumSize: const Size.fromHeight(44),
+                if (_canRejectTeam && _canApproveTeam)
+                  const SizedBox(width: 10),
+                if (_canApproveTeam)
+                  Expanded(
+                    child: ElevatedButton.icon(
+                      onPressed: isActing
+                          ? null
+                          : () => _confirmApproveTeamRequest(item),
+                      icon: isActing
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.white,
+                              ),
+                            )
+                          : const Icon(Icons.check_rounded),
+                      label: Text(isActing ? 'Processing...' : 'Approve'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF0F766E),
+                        foregroundColor: Colors.white,
+                        minimumSize: const Size.fromHeight(44),
+                      ),
+                    ),
                   ),
-                ),
-              ),
-            ],
-          ),
+              ],
+            ),
         ],
       ),
     );
   }
 
   Future<void> _confirmApproveTeamRequest(LeaveRequestItem item) async {
+    if (!_canApproveTeam) {
+      _showMessage('You do not have permission to approve leave requests.', isError: true);
+      return;
+    }
     final yes = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -1698,6 +1773,10 @@ class _LeaveScreenState extends State<LeaveScreen> {
   }
 
   Future<void> _confirmRejectTeamRequest(LeaveRequestItem item) async {
+    if (!_canRejectTeam) {
+      _showMessage('You do not have permission to reject leave requests.', isError: true);
+      return;
+    }
     final reasonController = TextEditingController();
     final yes = await showDialog<bool>(
       context: context,

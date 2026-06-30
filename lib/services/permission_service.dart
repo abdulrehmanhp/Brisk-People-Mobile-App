@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
+
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-// Models
+// Models — mirror backend UserPermissionResponse tree.
 
 class PermissionAction {
   final String actionId;
@@ -134,56 +136,131 @@ class UserPermissions {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PermissionService
-// ─────────────────────────────────────────────────────────────────────────────
+/// Central registry of action keys the mobile app checks — must match the web
+/// frontend and backend `[PermissionAuthorize]` attributes exactly.
+class PermissionKeys {
+  PermissionKeys._();
+
+  // Attendance → Time Tracker
+  static const String clockIn = 'CLOCK_IN_BUTTON';
+  static const String clockOut = 'CLOCK_OUT_BUTTON';
+  static const String recentAttendanceTable = 'RECENT_ATTENDANCE_TABLE';
+  static const String todaySessionTable = 'TODAY_SESSION_TABLE';
+
+  // Attendance → My Attendance
+  static const String myAttendanceSummary = 'my_attendance_summary';
+  static const String attendanceRecordTable = 'ATTENDANCE_RECORD_TABLE';
+
+  // Attendance → Shifts
+  static const String createShiftSwapRequest = 'SWAP_SHIFT_BUTTON';
+  static const String teamShiftSwapTable = 'TEAM_SHIFT_SWAP_TABLE';
+
+  // Leave Management → My Leaves
+  static const String myLeaveRequestLeave = 'my_leave_request_leave';
+  static const String myLeaveEditRequest = 'my_leave_edit_request';
+  static const String myLeaveCancelRequest = 'my_leave_cancel_request';
+
+  // Leave Management → Team Leaves / Team Requests
+  static const String teamLeaveApprove = 'team_leave_approve';
+  static const String teamLeaveReject = 'team_leave_reject';
+
+  // Payroll
+  static const String myPayslip = 'my_payslip';
+
+  // Admin
+  static const String adminDashboard = 'admin_dashboard';
+
+  /// Any key that unlocks the Payroll bottom-nav tab (mirrors web sidebar).
+  static const List<String> payrollNavActionKeys = [
+    'my_payslip',
+    'compliance_payslip_view',
+    'payslip_generation',
+    'mail_upload_payslip',
+    'payroll_rules_view',
+    'overtime_entry_view',
+    'attendance_summary_view',
+    'late_attendance_view',
+    'leave_summary_view',
+    'payroll_period_view',
+    'my_benefits',
+    'payroll_calculation',
+    'payroll_result',
+    'bonus_entry_view',
+    'performance_pay_view',
+    'loan_admin_view',
+    'pf_admin_view',
+    'gratuity_admin_view',
+    'salary_advance_admin_list',
+    'salary_advance_admin_view',
+  ];
+}
 
 class PermissionService {
   static const String _baseUrl =
       'https://hrmsapplicationcodifiedlabs-production.up.railway.app/api/Auth';
   static const String _permissionsKey = 'user_permissions';
 
-  // In-memory cache so we avoid repeated SharedPreferences reads every check.
   static UserPermissions? _cached;
+  static int _version = 0;
+  static final StreamController<int> _changesController =
+      StreamController<int>.broadcast();
 
-  // ── Fetch & persist ──────────────────────────────────────────────────────
+  /// Increments every time permissions are refreshed from the server.
+  static int get version => _version;
 
-  /// Fetches permissions for [userId] from the backend, stores them in
-  /// SharedPreferences and in the in-memory cache, then returns them.
-  /// Returns null on any error so callers can degrade gracefully.
+  /// Fires with the new [version] after permissions are updated.
+  static Stream<int> get onChanged => _changesController.stream;
+
+  static void _notifyChanged() {
+    _version++;
+    if (!_changesController.isClosed) {
+      _changesController.add(_version);
+    }
+  }
+
+  /// Loads from cache first, then refreshes from
+  /// `GET /api/Auth/get-user-permissions/{userId}`.
   static Future<UserPermissions?> fetchAndStore(String userId) async {
     if (userId.trim().isEmpty) return null;
 
     try {
-      final response = await http.get(
-        Uri.parse('$_baseUrl/get-user-permissions/$userId'),
-        headers: {'Content-Type': 'application/json'},
-      );
+      final prefs = await SharedPreferences.getInstance();
+      final token = prefs.getString('auth_token');
+      final headers = <String, String>{'Content-Type': 'application/json'};
+      if (token != null && token.isNotEmpty) {
+        headers['Authorization'] = 'Bearer $token';
+      }
 
-      if (response.statusCode < 200 || response.statusCode >= 300) return null;
+      final response = await http
+          .get(
+            Uri.parse('$_baseUrl/get-user-permissions/$userId'),
+            headers: headers,
+          )
+          .timeout(const Duration(seconds: 12));
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        return await getPermissions();
+      }
 
       final body = jsonDecode(response.body);
-      if (body is! Map<String, dynamic>) return null;
-      if (body['success'] != true) return null;
+      if (body is! Map<String, dynamic>) return await getPermissions();
+      if (body['success'] != true) return await getPermissions();
 
       final data = body['data'];
-      if (data is! Map<String, dynamic>) return null;
+      if (data is! Map<String, dynamic>) return await getPermissions();
 
       final permissions = UserPermissions.fromJson(data);
       _cached = permissions;
 
-      final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_permissionsKey, jsonEncode(permissions.toJson()));
 
+      _notifyChanged();
       return permissions;
     } catch (_) {
-      return null;
+      return await getPermissions();
     }
   }
 
-  // ── Load from cache ──────────────────────────────────────────────────────
-
-  /// Returns the cached permissions (memory first, then SharedPreferences).
   static Future<UserPermissions?> getPermissions() async {
     if (_cached != null) return _cached;
 
@@ -202,19 +279,13 @@ class PermissionService {
     }
   }
 
-  // ── Clear ────────────────────────────────────────────────────────────────
-
-  /// Clears cached permissions on logout.
   static Future<void> clear() async {
     _cached = null;
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_permissionsKey);
+    _notifyChanged();
   }
 
-  // ── Permission checks ────────────────────────────────────────────────────
-
-  /// Checks whether the user has the specific [actionKey] permission under
-  /// [menuName] → [subMenuName].
   static Future<bool> hasActionPermission(
     String menuName,
     String subMenuName,
@@ -225,8 +296,6 @@ class PermissionService {
     return _checkAction(permissions, menuName, subMenuName, actionKey);
   }
 
-  /// Synchronous version — only works if permissions are already in memory.
-  /// Use after [fetchAndStore] or [getPermissions] has been awaited.
   static bool hasActionPermissionSync(
     String menuName,
     String subMenuName,
@@ -236,26 +305,19 @@ class PermissionService {
     return _checkAction(_cached!, menuName, subMenuName, actionKey);
   }
 
-  /// Returns true if the user has at least one permitted action under
-  /// [menuName] → [subMenuName].
   static Future<bool> hasSubMenuPermission(
     String menuName,
-    String subMenuName,
-  ) async {
+    String subMenuName, {
+    List<String> aliases = const [],
+  }) async {
     final permissions = await getPermissions();
     if (permissions == null) return false;
-
-    final menu = _findMenu(permissions, menuName);
-    if (menu == null) return false;
-
-    final subMenu = _findSubMenu(menu, subMenuName);
-    if (subMenu == null) return false;
-
-    return subMenu.actions.any((a) => a.hasPermission);
+    return _hasAnySubMenuPermission(permissions, menuName, [
+      subMenuName,
+      ...aliases,
+    ]);
   }
 
-  /// Returns true if the user has at least one permitted action under any
-  /// sub-menu of [menuName].
   static Future<bool> hasMenuPermission(String menuName) async {
     final permissions = await getPermissions();
     if (permissions == null) return false;
@@ -268,7 +330,61 @@ class PermissionService {
     );
   }
 
-  // ── Private helpers ──────────────────────────────────────────────────────
+  static Future<bool> hasMenuParentPermission(String menuName) =>
+      hasMenuPermission(menuName);
+
+  static Future<bool> hasPermissionByActionKey(String actionKey) async {
+    final permissions = await getPermissions();
+    if (permissions == null) return false;
+    return _checkActionKeyAnywhere(permissions, actionKey);
+  }
+
+  static bool hasPermissionByActionKeySync(String actionKey) {
+    if (_cached == null) return false;
+    return _checkActionKeyAnywhere(_cached!, actionKey);
+  }
+
+  static Future<bool> hasAnyPermissionByActionKeys(
+    List<String> actionKeys,
+  ) async {
+    final permissions = await getPermissions();
+    if (permissions == null) return false;
+    return actionKeys.any((k) => _checkActionKeyAnywhere(permissions, k));
+  }
+
+  static bool hasAnyPermissionByActionKeysSync(List<String> actionKeys) {
+    if (_cached == null) return false;
+    return actionKeys.any((k) => _checkActionKeyAnywhere(_cached!, k));
+  }
+
+  static Future<String> dumpAsPrettyJson(String userId) async {
+    final fresh = await fetchAndStore(userId);
+    final permissions = fresh ?? await getPermissions();
+    if (permissions == null) {
+      return 'No permissions could be loaded for this user.\n'
+          'Check your internet connection and try again.';
+    }
+    const encoder = JsonEncoder.withIndent('  ');
+    return encoder.convert(permissions.toJson());
+  }
+
+  static bool _checkActionKeyAnywhere(
+    UserPermissions permissions,
+    String actionKey,
+  ) {
+    final normalized = actionKey.toLowerCase();
+    for (final menu in permissions.menus) {
+      for (final subMenu in menu.subMenus) {
+        for (final action in subMenu.actions) {
+          if (action.actionKey.toLowerCase() == normalized &&
+              action.hasPermission) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
 
   static bool _checkAction(
     UserPermissions permissions,
@@ -293,6 +409,23 @@ class PermissionService {
     );
 
     return action.hasPermission;
+  }
+
+  static bool _hasAnySubMenuPermission(
+    UserPermissions permissions,
+    String menuName,
+    List<String> subMenuNames,
+  ) {
+    final menu = _findMenu(permissions, menuName);
+    if (menu == null) return false;
+
+    for (final name in subMenuNames) {
+      final subMenu = _findSubMenu(menu, name);
+      if (subMenu != null && subMenu.actions.any((a) => a.hasPermission)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   static PermissionMenu? _findMenu(

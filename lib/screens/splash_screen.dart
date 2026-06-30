@@ -1,6 +1,7 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../services/auth_service.dart';
 import 'login_screen.dart';
 import 'main_nav_screen.dart';
 
@@ -58,6 +59,13 @@ class _SplashScreenState extends State<SplashScreen>
       } else {
         isLoggedIn = true;
       }
+    }
+
+    if (!mounted) return;
+
+    if (isLoggedIn) {
+      await AuthService.refreshPermissions();
+      await AuthService.startPermissionListener();
     }
 
     if (!mounted) return;

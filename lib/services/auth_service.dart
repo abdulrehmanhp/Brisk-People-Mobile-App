@@ -4,6 +4,7 @@ import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/auth_model.dart';
+import 'permission_hub_service.dart';
 import 'permission_service.dart';
 
 class AuthService {
@@ -34,6 +35,7 @@ class AuthService {
       // Fetch and cache permissions post-login
       if (authResponse.userId != null && authResponse.userId!.isNotEmpty) {
         await PermissionService.fetchAndStore(authResponse.userId!);
+        await PermissionHubService.start();
       }
       return authResponse;
     } else {
@@ -411,12 +413,26 @@ class AuthService {
   }
 
   static Future<void> logout() async {
+    await PermissionHubService.stop();
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('auth_token');
     await prefs.remove('refresh_token');
     await prefs.remove('token_expiry');
-    // Clear cached permissions so next user starts clean
     await PermissionService.clear();
+  }
+
+  /// Re-fetches permissions from the backend for the stored user id.
+  /// Called on app start, resume, and when SignalR broadcasts RoleUpdated.
+  static Future<void> refreshPermissions() async {
+    final prefs = await SharedPreferences.getInstance();
+    final userId = prefs.getString('user_id') ?? '';
+    if (userId.trim().isEmpty) return;
+    await PermissionService.fetchAndStore(userId);
+  }
+
+  /// Connects to the permission SignalR hub so role changes apply live.
+  static Future<void> startPermissionListener() async {
+    await PermissionHubService.start();
   }
 
   static String _profileUrlKey(String? userId, String? email) {

@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import '../services/attendance_service.dart';
 import '../services/auth_service.dart';
+import '../services/permission_service.dart';
+import '../widgets/permission_gate.dart';
 
 class AttendanceHistoryScreen extends StatefulWidget {
   const AttendanceHistoryScreen({super.key});
@@ -20,6 +22,8 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
   Map<String, String> _monthAttendance = {};
   // All sessions for the displayed month
   List<_DayRecord> _monthRecords = [];
+  bool _canViewRecords = false;
+  bool _permissionsResolved = false;
 
   @override
   void initState() {
@@ -31,7 +35,25 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
 
   Future<void> _init() async {
     _token = await AuthService.getToken();
-    await _loadMonth();
+    await _loadPermissionFlags();
+    if (_canViewRecords) {
+      await _loadMonth();
+    } else if (mounted) {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _loadPermissionFlags() async {
+    final allowed = await PermissionService.hasAnyPermissionByActionKeys([
+      PermissionKeys.myAttendanceSummary,
+      PermissionKeys.attendanceRecordTable,
+      PermissionKeys.recentAttendanceTable,
+    ]);
+    if (!mounted) return;
+    setState(() {
+      _canViewRecords = allowed;
+      _permissionsResolved = true;
+    });
   }
 
   Future<void> _loadMonth() async {
@@ -167,6 +189,18 @@ class _AttendanceHistoryScreenState extends State<AttendanceHistoryScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_permissionsResolved) {
+      return const Scaffold(
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (!_canViewRecords) {
+      return const PermissionDeniedScaffold(
+        featureName: 'Attendance History',
+      );
+    }
+
     final now = DateTime.now();
     final firstOfMonth =
         DateTime(_displayedMonth.year, _displayedMonth.month, 1);
